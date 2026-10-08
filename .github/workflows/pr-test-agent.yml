@@ -1,0 +1,62 @@
+name: PR Test Agent
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [main]
+
+# Minimal permissions: write content to commit tests, write pull-requests to comment.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  generate-tests:
+    name: Generate & verify tests
+    runs-on: ubuntu-latest
+
+    # Only run on PRs from the same repository.
+    # Forks cannot receive the GITHUB_TOKEN push credential needed to commit back.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          # persist-credentials=true (default) allows the agent to push commits.
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install backend test dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install agent dependencies
+        working-directory: agent
+        run: pip install -r requirements.txt
+
+      - name: Run test agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL_NAME: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_REF: ${{ github.head_ref }}
+        run: python agent/main.py
