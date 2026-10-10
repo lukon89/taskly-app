@@ -24,8 +24,8 @@ import anthropic
 from skills import analyze, evaluate, git_ops, github_api, test_runner
 
 REPO_ROOT = Path(__file__).parent.parent
-MAX_RETRIES_PER_FILE = 3
 MAX_AGENT_TURNS = 60  # safety cap to avoid runaway loops
+MODEL = os.environ.get("AGENT_MODEL", "claude-opus-4-5")
 
 
 # ---------------------------------------------------------------------------
@@ -340,10 +340,14 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
         kind = analyze.classify(f["filename"])
         test_path = analyze.expected_test_path(f["filename"])
         patch = f.get("patch", "(binary or no diff available)")
+        _PATCH_LIMIT = 3000
+        patch_body = patch[:_PATCH_LIMIT]
+        if len(patch) > _PATCH_LIMIT:
+            patch_body += "\n... (diff truncated — only the first 3000 characters are shown)"
         file_summaries.append(
             f"### {f['filename']} ({kind}, status: {f['status']})\n"
             f"Expected test file: `{test_path}`\n\n"
-            f"```diff\n{patch[:3000]}\n```"
+            f"```diff\n{patch_body}\n```"
         )
 
     user_message = (
@@ -365,7 +369,7 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
 
     for turn in range(MAX_AGENT_TURNS):
         response = client.messages.create(
-            model="claude-opus-4-5",
+            model=MODEL,
             max_tokens=8096,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
@@ -389,7 +393,8 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
             print(f"Unexpected stop_reason: {response.stop_reason}", file=sys.stderr)
             break
 
-        # Execute every tool call in the response
+        # Execute every tool call in the response — collect all results before
+        # deciding to exit, so no tool result is silently dropped.
         tool_results = []
         for block in response.content:
             if block.type != "tool_use":
@@ -402,13 +407,11 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
                 "content": result_text[:8000],  # cap to avoid oversized context
             })
 
-            # Early exit after comment is posted
-            if block.name == "post_pr_comment" and context.comment_posted:
-                messages.append({"role": "user", "content": tool_results})
-                print("Agent completed successfully.", flush=True)
-                return
-
         messages.append({"role": "user", "content": tool_results})
+
+        if context.comment_posted:
+            print("Agent completed successfully.", flush=True)
+            return
 
     else:
         print(f"Reached turn limit ({MAX_AGENT_TURNS}) without completion.", file=sys.stderr)

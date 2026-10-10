@@ -24,6 +24,7 @@ def run_backend_tests(test_path: str, repo_root: str = ".") -> TestResult:
         capture_output=True,
         text=True,
         cwd=str(Path(repo_root) / "backend"),
+        timeout=120,
     )
     output = result.stdout + result.stderr
     return TestResult(
@@ -51,6 +52,7 @@ def run_frontend_tests(test_path: str, repo_root: str = ".") -> TestResult:
         capture_output=True,
         text=True,
         cwd=str(frontend_root),
+        timeout=120,
     )
     output = result.stdout + result.stderr
     return TestResult(
