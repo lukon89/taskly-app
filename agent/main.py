@@ -177,17 +177,33 @@ def _evaluate_if_passed(
     )
 
 
+def _resolve_safe_path(raw: str) -> Path | None:
+    """Resolve a repo-relative path and verify it stays inside REPO_ROOT.
+
+    Returns the resolved absolute Path, or None if the path escapes the
+    repository root (e.g. via '../..' or an absolute path outside the repo).
+    """
+    resolved = (REPO_ROOT / raw).resolve()
+    if not resolved.is_relative_to(REPO_ROOT.resolve()):
+        return None
+    return resolved
+
+
 def execute_tool(name: str, inputs: dict, context: dict) -> str:
     """Execute one tool call and return the result as a string."""
 
     if name == "read_file":
-        path = REPO_ROOT / inputs["path"]
+        path = _resolve_safe_path(inputs["path"])
+        if path is None:
+            return "Access denied: path outside repository root."
         if not path.exists():
             return f"File not found: {inputs['path']}"
         return path.read_text(encoding="utf-8")
 
     if name == "write_file":
-        path = REPO_ROOT / inputs["path"]
+        path = _resolve_safe_path(inputs["path"])
+        if path is None:
+            return "Access denied: path outside repository root."
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(inputs["content"], encoding="utf-8")
         context.setdefault("written_files", [])
