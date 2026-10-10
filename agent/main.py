@@ -20,7 +20,7 @@ from pathlib import Path
 
 import anthropic
 
-from skills import analyze, git_ops, github_api, test_runner
+from skills import analyze, evaluate, git_ops, github_api, test_runner
 
 REPO_ROOT = Path(__file__).parent.parent
 MAX_RETRIES_PER_FILE = 3
@@ -148,6 +148,35 @@ TOOLS: list[dict] = [
 # Tool executor — dispatches a tool call to the correct skill
 # ---------------------------------------------------------------------------
 
+def _evaluate_if_passed(
+    result: test_runner.TestResult,
+    test_repo_path: str,
+    kind: str,
+    context: dict,
+) -> str | None:
+    """Run the quality judge when tests pass.
+
+    Returns a formatted rejection message for Claude to act on, or None if the
+    tests are approved (or if the judge is unavailable).
+    """
+    if not result.passed:
+        return None
+    full_path = REPO_ROOT / test_repo_path
+    if not full_path.exists():
+        return None
+    test_content = full_path.read_text(encoding="utf-8")
+    source_diff = context.get("diffs", {}).get(test_repo_path, "")
+    verdict = evaluate.evaluate_test_quality(source_diff, test_content, kind)
+    if verdict.approved:
+        return None
+    issues = "\n".join(f"- {issue}" for issue in verdict.issues)
+    return (
+        f"[PASSED but QUALITY REJECTED — score {verdict.score}/5]\n"
+        f"{issues}\n\n"
+        "Rewrite the test file to address these issues, then run again."
+    )
+
+
 def execute_tool(name: str, inputs: dict, context: dict) -> str:
     """Execute one tool call and return the result as a string."""
 
@@ -168,11 +197,17 @@ def execute_tool(name: str, inputs: dict, context: dict) -> str:
 
     if name == "run_backend_tests":
         result = test_runner.run_backend_tests(inputs["test_path"], str(REPO_ROOT))
+        rejection = _evaluate_if_passed(result, "backend/" + inputs["test_path"], "backend", context)
+        if rejection:
+            return rejection
         status = "PASSED" if result.passed else "FAILED"
         return f"[{status}]\n{result.output}"
 
     if name == "run_frontend_tests":
         result = test_runner.run_frontend_tests(inputs["test_path"], str(REPO_ROOT))
+        rejection = _evaluate_if_passed(result, inputs["test_path"], "frontend", context)
+        if rejection:
+            return rejection
         status = "PASSED" if result.passed else "FAILED"
         return f"[{status}]\n{result.output}"
 
@@ -291,6 +326,11 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
         "pr_branch": pr_branch,
         "written_files": [],
         "comment_posted": False,
+        # Maps expected test path → source diff, used by the quality judge.
+        "diffs": {
+            analyze.expected_test_path(f["filename"]): f.get("patch", "")
+            for f in testable
+        },
     }
 
     for turn in range(MAX_AGENT_TURNS):
