@@ -152,6 +152,7 @@ agent/
 - **No visual / browser tests** — the agent writes unit tests only; end-to-end or snapshot tests are out of scope.
 - **Token budget** — very large PRs (many files, long diffs) may approach the context limit. The agent caps patch content at 3,000 characters per file and tool results at 8,000 characters.
 - **Design-system components** — filtered out by `analyze.py`; they require Storybook-style tests that are harder to generate automatically.
+- **Existing-test detection is naming-convention-based, not coverage-based** — `analyze.expected_test_path()` derives a single canonical path per source file (e.g. `router.py` → `test_router.py`) and the agent only checks that exact path via `read_file`. There is no actual coverage analysis (`pytest --cov` / `vitest --coverage`) run before generation, and PR-added test files under a non-conventional path or name are filtered out of the agent's context entirely (`_SKIP_PATTERNS` excludes them from `filter_changed_files`). If a test already exists under a different path, the agent has no way to detect it and may write a duplicate/overlapping test file. Acceptable for this project's scope, but a real gap for a production rollout.
 
 ---
 
