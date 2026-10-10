@@ -16,7 +16,7 @@ _SKIP_PATTERNS = (
     re.compile(r"/node_modules/"),
     re.compile(r"\.(md|txt|json|yaml|yml|toml|ini|env|gitignore|prettierrc|dockerignore|css)$"),
     re.compile(r"^(Dockerfile|compose\.yaml|requirements.*\.txt|pytest\.ini|vite\.config\.|tsconfig\.)"),
-    re.compile(r"/stories\.[jt]sx?$"),
+    re.compile(r"\.stories\.[jt]sx?$"),
     re.compile(r"/index\.[jt]sx?$"),
     re.compile(r"/types?\.[jt]s$"),
     re.compile(r"/constants?\.[jt]s$"),
@@ -35,6 +35,12 @@ _FRONTEND_EXTENSIONS = {".ts", ".tsx"}
 
 def is_testable(path: str) -> bool:
     """Return True if this file is a source file that could benefit from tests."""
+    if not (path.startswith("backend/") or path.startswith("frontend/")):
+        # expected_test_path() has no convention to follow outside these two
+        # trees and falls back to returning the source path unchanged — never
+        # treat such files as testable, or the agent could be told to write a
+        # "test" over the original source file.
+        return False
     for pattern in _SKIP_PATTERNS:
         if pattern.search(path):
             return False
@@ -72,6 +78,20 @@ def expected_test_path(source_path: str) -> str:
         return str(p.with_name(p.stem + ".test" + p.suffix))
 
     return source_path
+
+
+def is_valid_test_path(path: str) -> bool:
+    """Return True if `path` is a test file the agent is allowed to write or commit.
+
+    This is the write-time counterpart to `is_testable`: it stops `write_file`
+    and `commit_tests` from touching anything that isn't a conventional test
+    file, even if the model is instructed (or hallucinates) otherwise.
+    """
+    if path.startswith("backend/tests/"):
+        return path.endswith(".py") and Path(path).name.startswith("test_")
+    if path.startswith("frontend/src/"):
+        return bool(re.search(r"\.(test|spec)\.[jt]sx?$", path))
+    return False
 
 
 def filter_changed_files(pr_files: list[dict]) -> list[dict]:

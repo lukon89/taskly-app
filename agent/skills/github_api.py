@@ -43,24 +43,28 @@ def _request(
         raise RuntimeError(f"GitHub API {method} {path} → {exc.code}: {detail}") from exc
 
 
+_PAGE_SIZE = 100  # GitHub's maximum per-page for this endpoint
+
+
 def get_pr_files(repo: str, pr_number: int) -> list[dict[str, Any]]:
-    """Return the list of files changed in a pull request.
+    """Return all files changed in a pull request, following pagination.
 
-    Each entry has at least: filename, status, patch (may be absent for binary files).
+    GitHub returns at most 100 files per page; this function fetches all pages
+    so no files are silently dropped on large PRs.
+    Each entry has at least: filename, status, patch (absent for binary files).
     """
-    return _request("GET", f"/repos/{repo}/pulls/{pr_number}/files")
-
-
-def get_file_contents(repo: str, ref: str, path: str) -> str | None:
-    """Fetch file content at a specific git ref. Returns None if file does not exist."""
-    try:
-        data = _request("GET", f"/repos/{repo}/contents/{path}?ref={ref}")
-    except RuntimeError as exc:
-        if "404" in str(exc):
-            return None
-        raise
-    import base64
-    return base64.b64decode(data["content"]).decode()
+    files: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        batch = _request(
+            "GET",
+            f"/repos/{repo}/pulls/{pr_number}/files?per_page={_PAGE_SIZE}&page={page}",
+        )
+        files.extend(batch)
+        if len(batch) < _PAGE_SIZE:
+            break
+        page += 1
+    return files
 
 
 def post_pr_comment(repo: str, pr_number: int, body: str) -> None:

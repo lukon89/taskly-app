@@ -16,15 +16,37 @@ from __future__ import annotations
 import json
 import os
 import sys
+import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import anthropic
 
-from skills import analyze, git_ops, github_api, test_runner
+from skills import analyze, evaluate, git_ops, github_api, test_runner
 
 REPO_ROOT = Path(__file__).parent.parent
-MAX_RETRIES_PER_FILE = 3
 MAX_AGENT_TURNS = 60  # safety cap to avoid runaway loops
+MODEL = os.environ.get("AGENT_MODEL", "claude-opus-4-5")
+_PATCH_LIMIT = 3000  # characters of diff shown per file in the initial prompt
+_TOOL_RESULT_LIMIT = 8000  # characters of tool output kept per turn, to bound context growth
+_PR_COMMENT_LIMIT = 60000  # stay under GitHub's 65536-character comment body limit
+
+
+# ---------------------------------------------------------------------------
+# Agent run context — typed state shared across the agentic loop
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AgentContext:
+    repo: str
+    pr_number: int
+    pr_branch: str
+    # Maps expected test path → source diff (used by the quality judge).
+    diffs: dict[str, str] = field(default_factory=dict)
+    written_files: list[str] = field(default_factory=list)
+    comment_posted: bool = False
+    commit_sha: str | None = None
+
 
 # ---------------------------------------------------------------------------
 # Tool definitions — each tool corresponds to one reusable skill
@@ -148,54 +170,135 @@ TOOLS: list[dict] = [
 # Tool executor — dispatches a tool call to the correct skill
 # ---------------------------------------------------------------------------
 
-def execute_tool(name: str, inputs: dict, context: dict) -> str:
-    """Execute one tool call and return the result as a string."""
+def _evaluate_if_passed(
+    result: test_runner.TestResult,
+    test_repo_path: str,
+    kind: str,
+    context: AgentContext,
+) -> str | None:
+    """Run the quality judge when tests pass.
 
+    Returns a formatted rejection message for Claude to act on, or None if the
+    tests are approved (or if the judge is unavailable).
+    """
+    if not result.passed:
+        return None
+    full_path = REPO_ROOT / test_repo_path
+    if not full_path.exists():
+        return None
+    test_content = full_path.read_text(encoding="utf-8")
+    source_diff = context.diffs.get(test_repo_path, "")
+    verdict = evaluate.evaluate_test_quality(source_diff, test_content, kind)
+    if verdict.approved:
+        return None
+    issues = "\n".join(f"- {issue}" for issue in verdict.issues)
+    return (
+        f"[PASSED but QUALITY REJECTED — score {verdict.score}/5]\n"
+        f"{issues}\n\n"
+        "Rewrite the test file to address these issues, then run again."
+    )
+
+
+def _resolve_safe_path(raw: str) -> Path | None:
+    """Resolve a repo-relative path and verify it stays inside REPO_ROOT.
+
+    Returns the resolved absolute Path, or None if the path escapes the
+    repository root (e.g. via '../..' or an absolute path outside the repo).
+    """
+    resolved = (REPO_ROOT / raw).resolve()
+    if not resolved.is_relative_to(REPO_ROOT.resolve()):
+        return None
+    return resolved
+
+
+def execute_tool(name: str, inputs: dict, context: AgentContext) -> str:
+    """Execute one tool call and return the result as a string.
+
+    Any exception raised while dispatching the tool (bad/missing input keys,
+    subprocess failures, git push errors, test timeouts, GitHub API errors)
+    is caught here and turned into an error string for the model to see —
+    a single tool failure must never crash the whole agentic run silently.
+    """
+    try:
+        return _dispatch_tool(name, inputs, context)
+    except Exception as exc:  # noqa: BLE001 - tool failures must surface, not crash the run
+        traceback.print_exc()
+        return f"Tool '{name}' failed: {exc}"
+
+
+def _dispatch_tool(name: str, inputs: dict, context: AgentContext) -> str:
     if name == "read_file":
-        path = REPO_ROOT / inputs["path"]
+        path = _resolve_safe_path(inputs["path"])
+        if path is None:
+            return "Access denied: path outside repository root."
         if not path.exists():
             return f"File not found: {inputs['path']}"
         return path.read_text(encoding="utf-8")
 
     if name == "write_file":
-        path = REPO_ROOT / inputs["path"]
+        if not analyze.is_valid_test_path(inputs["path"]):
+            return (
+                f"Refused: '{inputs['path']}' is not a conventional test file path "
+                "(expected backend/tests/**/test_*.py or frontend/src/**/*.test.ts(x)|*.spec.ts(x)). "
+                "Only test files may be written."
+            )
+        path = _resolve_safe_path(inputs["path"])
+        if path is None:
+            return "Access denied: path outside repository root."
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(inputs["content"], encoding="utf-8")
-        context.setdefault("written_files", [])
-        if inputs["path"] not in context["written_files"]:
-            context["written_files"].append(inputs["path"])
+        if inputs["path"] not in context.written_files:
+            context.written_files.append(inputs["path"])
         return f"Written: {inputs['path']}"
 
     if name == "run_backend_tests":
         result = test_runner.run_backend_tests(inputs["test_path"], str(REPO_ROOT))
+        rejection = _evaluate_if_passed(result, "backend/" + inputs["test_path"], "backend", context)
+        if rejection:
+            return rejection
         status = "PASSED" if result.passed else "FAILED"
         return f"[{status}]\n{result.output}"
 
     if name == "run_frontend_tests":
         result = test_runner.run_frontend_tests(inputs["test_path"], str(REPO_ROOT))
+        rejection = _evaluate_if_passed(result, inputs["test_path"], "frontend", context)
+        if rejection:
+            return rejection
         status = "PASSED" if result.passed else "FAILED"
         return f"[{status}]\n{result.output}"
 
     if name == "commit_tests":
+        invalid = [
+            p for p in inputs["paths"]
+            if p not in context.written_files or not analyze.is_valid_test_path(p)
+        ]
+        if invalid:
+            return (
+                "Refused: the following paths were either not written by write_file "
+                f"in this session, or are not valid test file paths: {invalid}"
+            )
         git_ops.configure_git(str(REPO_ROOT))
         sha = git_ops.commit_and_push(
             paths=inputs["paths"],
             message=inputs["message"],
-            branch=context["pr_branch"],
+            branch=context.pr_branch,
             repo_root=str(REPO_ROOT),
         )
         if sha:
-            context["commit_sha"] = sha
+            context.commit_sha = sha
             return f"Committed and pushed: {sha}"
         return "Nothing to commit — files already staged or unchanged."
 
     if name == "post_pr_comment":
+        body = inputs["body"]
+        if len(body) > _PR_COMMENT_LIMIT:
+            body = body[:_PR_COMMENT_LIMIT] + "\n\n... (comment truncated)"
         github_api.post_pr_comment(
-            repo=context["repo"],
-            pr_number=context["pr_number"],
-            body=inputs["body"],
+            repo=context.repo,
+            pr_number=context.pr_number,
+            body=body,
         )
-        context["comment_posted"] = True
+        context.comment_posted = True
         return "Comment posted."
 
     return f"Unknown tool: {name}"
@@ -272,10 +375,13 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
         kind = analyze.classify(f["filename"])
         test_path = analyze.expected_test_path(f["filename"])
         patch = f.get("patch", "(binary or no diff available)")
+        patch_body = patch[:_PATCH_LIMIT]
+        if len(patch) > _PATCH_LIMIT:
+            patch_body += f"\n... (diff truncated — only the first {_PATCH_LIMIT} characters are shown)"
         file_summaries.append(
             f"### {f['filename']} ({kind}, status: {f['status']})\n"
             f"Expected test file: `{test_path}`\n\n"
-            f"```diff\n{patch[:3000]}\n```"
+            f"```diff\n{patch_body}\n```"
         )
 
     user_message = (
@@ -285,17 +391,19 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
     )
 
     messages: list[dict] = [{"role": "user", "content": user_message}]
-    context: dict = {
-        "repo": repo,
-        "pr_number": pr_number,
-        "pr_branch": pr_branch,
-        "written_files": [],
-        "comment_posted": False,
-    }
+    context = AgentContext(
+        repo=repo,
+        pr_number=pr_number,
+        pr_branch=pr_branch,
+        diffs={
+            analyze.expected_test_path(f["filename"]): f.get("patch", "")
+            for f in testable
+        },
+    )
 
     for turn in range(MAX_AGENT_TURNS):
         response = client.messages.create(
-            model="claude-opus-4-5",
+            model=MODEL,
             max_tokens=8096,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
@@ -307,7 +415,7 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
 
         if response.stop_reason == "end_turn":
             # Agent is done — if it didn't post a comment, post a fallback
-            if not context.get("comment_posted"):
+            if not context.comment_posted:
                 github_api.post_pr_comment(
                     repo=repo,
                     pr_number=pr_number,
@@ -319,35 +427,50 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
             print(f"Unexpected stop_reason: {response.stop_reason}", file=sys.stderr)
             break
 
-        # Execute every tool call in the response
+        # Execute every tool call in the response — collect all results before
+        # deciding to exit, so no tool result is silently dropped.
         tool_results = []
         for block in response.content:
             if block.type != "tool_use":
                 continue
             print(f"[tool] {block.name}({json.dumps(block.input)[:120]})", flush=True)
             result_text = execute_tool(block.name, block.input, context)
+            content_text = result_text[:_TOOL_RESULT_LIMIT]
+            if len(result_text) > _TOOL_RESULT_LIMIT:
+                content_text += "\n... (tool output truncated)"
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
-                "content": result_text[:8000],  # cap to avoid oversized context
+                "content": content_text,
             })
-
-            # Early exit after comment is posted
-            if block.name == "post_pr_comment" and context.get("comment_posted"):
-                messages.append({"role": "user", "content": tool_results})
-                print("Agent completed successfully.", flush=True)
-                return
 
         messages.append({"role": "user", "content": tool_results})
 
+        if context.comment_posted:
+            print("Agent completed successfully.", flush=True)
+            return
+
     else:
         print(f"Reached turn limit ({MAX_AGENT_TURNS}) without completion.", file=sys.stderr)
+        if not context.comment_posted:
+            github_api.post_pr_comment(
+                repo=repo,
+                pr_number=pr_number,
+                body=(
+                    "## Test Agent\n\n"
+                    f"Reached the turn limit ({MAX_AGENT_TURNS}) before finishing. "
+                    "Check the workflow run logs for details."
+                ),
+            )
 
 
 def main() -> None:
-    repo = os.environ["REPO_FULL_NAME"]
-    pr_number = int(os.environ["PR_NUMBER"])
-    pr_branch = os.environ["PR_HEAD_REF"]
+    try:
+        repo = os.environ["REPO_FULL_NAME"]
+        pr_number = int(os.environ["PR_NUMBER"])
+        pr_branch = os.environ["PR_HEAD_REF"]
+    except KeyError as exc:
+        sys.exit(f"Missing required environment variable: {exc}")
     run(repo, pr_number, pr_branch)
 
 

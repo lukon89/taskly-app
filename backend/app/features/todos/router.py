@@ -1,17 +1,20 @@
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, Response
+from fastapi import APIRouter, HTTPException, Path, Query, Response
 
 from ...api.dependencies import Repository
-from .schemas import Todo, TodoCreate, TodoUpdate
+from .schemas import Priority, Todo, TodoCreate, TodoUpdate
 
 router = APIRouter(prefix="/api/todos", tags=["todos"])
 TodoId = Annotated[int, Path(gt=0)]
 
 
 @router.get("", response_model=list[Todo])
-def list_todos(repo: Repository):
-    return repo.list()
+def list_todos(
+    repo: Repository,
+    priority: Priority | None = Query(default=None),
+):
+    return repo.list(priority=priority)
 
 
 @router.post("", response_model=Todo, status_code=201)
