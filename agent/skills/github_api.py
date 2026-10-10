@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import urllib.error
@@ -43,12 +44,28 @@ def _request(
         raise RuntimeError(f"GitHub API {method} {path} → {exc.code}: {detail}") from exc
 
 
-def get_pr_files(repo: str, pr_number: int) -> list[dict[str, Any]]:
-    """Return the list of files changed in a pull request.
+_PAGE_SIZE = 100  # GitHub's maximum per-page for this endpoint
 
-    Each entry has at least: filename, status, patch (may be absent for binary files).
+
+def get_pr_files(repo: str, pr_number: int) -> list[dict[str, Any]]:
+    """Return all files changed in a pull request, following pagination.
+
+    GitHub returns at most 100 files per page; this function fetches all pages
+    so no files are silently dropped on large PRs.
+    Each entry has at least: filename, status, patch (absent for binary files).
     """
-    return _request("GET", f"/repos/{repo}/pulls/{pr_number}/files")
+    files: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        batch = _request(
+            "GET",
+            f"/repos/{repo}/pulls/{pr_number}/files?per_page={_PAGE_SIZE}&page={page}",
+        )
+        files.extend(batch)
+        if len(batch) < _PAGE_SIZE:
+            break
+        page += 1
+    return files
 
 
 def get_file_contents(repo: str, ref: str, path: str) -> str | None:
@@ -59,7 +76,6 @@ def get_file_contents(repo: str, ref: str, path: str) -> str | None:
         if "404" in str(exc):
             return None
         raise
-    import base64
     return base64.b64decode(data["content"]).decode()
 
 
