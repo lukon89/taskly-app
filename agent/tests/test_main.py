@@ -1,9 +1,9 @@
-"""Tests for agent/main.py — _resolve_safe_path."""
+"""Tests for agent/main.py — _resolve_safe_path, AgentContext."""
 from __future__ import annotations
 
 import pytest
 
-from main import REPO_ROOT, _resolve_safe_path
+from main import REPO_ROOT, AgentContext, _resolve_safe_path
 
 
 # ---------------------------------------------------------------------------
@@ -54,3 +54,28 @@ def test_resolve_safe_path_resolves_to_absolute() -> None:
     assert result is not None
     # The /../ is collapsed, so the result must still be inside the repo
     assert result.is_relative_to(REPO_ROOT.resolve())
+
+
+# ---------------------------------------------------------------------------
+# AgentContext — defaults and mutation
+# ---------------------------------------------------------------------------
+
+def test_agent_context_defaults() -> None:
+    ctx = AgentContext(repo="owner/repo", pr_number=1, pr_branch="feat/x")
+    assert ctx.written_files == []
+    assert ctx.comment_posted is False
+    assert ctx.commit_sha is None
+    assert ctx.diffs == {}
+
+
+def test_agent_context_written_files_are_not_shared_between_instances() -> None:
+    ctx1 = AgentContext(repo="owner/repo", pr_number=1, pr_branch="a")
+    ctx2 = AgentContext(repo="owner/repo", pr_number=2, pr_branch="b")
+    ctx1.written_files.append("file.py")
+    assert ctx2.written_files == []
+
+
+def test_agent_context_stores_diffs() -> None:
+    diffs = {"backend/tests/features/todos/test_router.py": "@@-1+2@@\n+def foo(): ..."}
+    ctx = AgentContext(repo="owner/repo", pr_number=7, pr_branch="feat/y", diffs=diffs)
+    assert ctx.diffs["backend/tests/features/todos/test_router.py"].startswith("@@")

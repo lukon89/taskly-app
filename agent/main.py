@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import anthropic
@@ -25,6 +26,23 @@ from skills import analyze, evaluate, git_ops, github_api, test_runner
 REPO_ROOT = Path(__file__).parent.parent
 MAX_RETRIES_PER_FILE = 3
 MAX_AGENT_TURNS = 60  # safety cap to avoid runaway loops
+
+
+# ---------------------------------------------------------------------------
+# Agent run context — typed state shared across the agentic loop
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AgentContext:
+    repo: str
+    pr_number: int
+    pr_branch: str
+    # Maps expected test path → source diff (used by the quality judge).
+    diffs: dict[str, str] = field(default_factory=dict)
+    written_files: list[str] = field(default_factory=list)
+    comment_posted: bool = False
+    commit_sha: str | None = None
+
 
 # ---------------------------------------------------------------------------
 # Tool definitions — each tool corresponds to one reusable skill
@@ -152,7 +170,7 @@ def _evaluate_if_passed(
     result: test_runner.TestResult,
     test_repo_path: str,
     kind: str,
-    context: dict,
+    context: AgentContext,
 ) -> str | None:
     """Run the quality judge when tests pass.
 
@@ -165,7 +183,7 @@ def _evaluate_if_passed(
     if not full_path.exists():
         return None
     test_content = full_path.read_text(encoding="utf-8")
-    source_diff = context.get("diffs", {}).get(test_repo_path, "")
+    source_diff = context.diffs.get(test_repo_path, "")
     verdict = evaluate.evaluate_test_quality(source_diff, test_content, kind)
     if verdict.approved:
         return None
@@ -189,7 +207,7 @@ def _resolve_safe_path(raw: str) -> Path | None:
     return resolved
 
 
-def execute_tool(name: str, inputs: dict, context: dict) -> str:
+def execute_tool(name: str, inputs: dict, context: AgentContext) -> str:
     """Execute one tool call and return the result as a string."""
 
     if name == "read_file":
@@ -206,9 +224,8 @@ def execute_tool(name: str, inputs: dict, context: dict) -> str:
             return "Access denied: path outside repository root."
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(inputs["content"], encoding="utf-8")
-        context.setdefault("written_files", [])
-        if inputs["path"] not in context["written_files"]:
-            context["written_files"].append(inputs["path"])
+        if inputs["path"] not in context.written_files:
+            context.written_files.append(inputs["path"])
         return f"Written: {inputs['path']}"
 
     if name == "run_backend_tests":
@@ -232,21 +249,21 @@ def execute_tool(name: str, inputs: dict, context: dict) -> str:
         sha = git_ops.commit_and_push(
             paths=inputs["paths"],
             message=inputs["message"],
-            branch=context["pr_branch"],
+            branch=context.pr_branch,
             repo_root=str(REPO_ROOT),
         )
         if sha:
-            context["commit_sha"] = sha
+            context.commit_sha = sha
             return f"Committed and pushed: {sha}"
         return "Nothing to commit — files already staged or unchanged."
 
     if name == "post_pr_comment":
         github_api.post_pr_comment(
-            repo=context["repo"],
-            pr_number=context["pr_number"],
+            repo=context.repo,
+            pr_number=context.pr_number,
             body=inputs["body"],
         )
-        context["comment_posted"] = True
+        context.comment_posted = True
         return "Comment posted."
 
     return f"Unknown tool: {name}"
@@ -336,18 +353,15 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
     )
 
     messages: list[dict] = [{"role": "user", "content": user_message}]
-    context: dict = {
-        "repo": repo,
-        "pr_number": pr_number,
-        "pr_branch": pr_branch,
-        "written_files": [],
-        "comment_posted": False,
-        # Maps expected test path → source diff, used by the quality judge.
-        "diffs": {
+    context = AgentContext(
+        repo=repo,
+        pr_number=pr_number,
+        pr_branch=pr_branch,
+        diffs={
             analyze.expected_test_path(f["filename"]): f.get("patch", "")
             for f in testable
         },
-    }
+    )
 
     for turn in range(MAX_AGENT_TURNS):
         response = client.messages.create(
@@ -363,7 +377,7 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
 
         if response.stop_reason == "end_turn":
             # Agent is done — if it didn't post a comment, post a fallback
-            if not context.get("comment_posted"):
+            if not context.comment_posted:
                 github_api.post_pr_comment(
                     repo=repo,
                     pr_number=pr_number,
@@ -389,7 +403,7 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
             })
 
             # Early exit after comment is posted
-            if block.name == "post_pr_comment" and context.get("comment_posted"):
+            if block.name == "post_pr_comment" and context.comment_posted:
                 messages.append({"role": "user", "content": tool_results})
                 print("Agent completed successfully.", flush=True)
                 return
