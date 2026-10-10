@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import urllib.error
@@ -66,17 +65,6 @@ def get_pr_files(repo: str, pr_number: int) -> list[dict[str, Any]]:
             break
         page += 1
     return files
-
-
-def get_file_contents(repo: str, ref: str, path: str) -> str | None:
-    """Fetch file content at a specific git ref. Returns None if file does not exist."""
-    try:
-        data = _request("GET", f"/repos/{repo}/contents/{path}?ref={ref}")
-    except RuntimeError as exc:
-        if "404" in str(exc):
-            return None
-        raise
-    return base64.b64decode(data["content"]).decode()
 
 
 def post_pr_comment(repo: str, pr_number: int, body: str) -> None:

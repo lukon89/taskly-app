@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 
 import anthropic
 
 logger = logging.getLogger(__name__)
+
+_JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "claude-haiku-4-5-20251001")
 
 _VERDICT_TOOL: dict = {
     "name": "report_verdict",
@@ -82,7 +85,7 @@ def evaluate_test_quality(
     )
     try:
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=_JUDGE_MODEL,
             max_tokens=512,
             system=_SYSTEM,
             tools=[_VERDICT_TOOL],

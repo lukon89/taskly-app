@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,6 +27,9 @@ from skills import analyze, evaluate, git_ops, github_api, test_runner
 REPO_ROOT = Path(__file__).parent.parent
 MAX_AGENT_TURNS = 60  # safety cap to avoid runaway loops
 MODEL = os.environ.get("AGENT_MODEL", "claude-opus-4-5")
+_PATCH_LIMIT = 3000  # characters of diff shown per file in the initial prompt
+_TOOL_RESULT_LIMIT = 8000  # characters of tool output kept per turn, to bound context growth
+_PR_COMMENT_LIMIT = 60000  # stay under GitHub's 65536-character comment body limit
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +212,21 @@ def _resolve_safe_path(raw: str) -> Path | None:
 
 
 def execute_tool(name: str, inputs: dict, context: AgentContext) -> str:
-    """Execute one tool call and return the result as a string."""
+    """Execute one tool call and return the result as a string.
 
+    Any exception raised while dispatching the tool (bad/missing input keys,
+    subprocess failures, git push errors, test timeouts, GitHub API errors)
+    is caught here and turned into an error string for the model to see —
+    a single tool failure must never crash the whole agentic run silently.
+    """
+    try:
+        return _dispatch_tool(name, inputs, context)
+    except Exception as exc:  # noqa: BLE001 - tool failures must surface, not crash the run
+        traceback.print_exc()
+        return f"Tool '{name}' failed: {exc}"
+
+
+def _dispatch_tool(name: str, inputs: dict, context: AgentContext) -> str:
     if name == "read_file":
         path = _resolve_safe_path(inputs["path"])
         if path is None:
@@ -219,6 +236,12 @@ def execute_tool(name: str, inputs: dict, context: AgentContext) -> str:
         return path.read_text(encoding="utf-8")
 
     if name == "write_file":
+        if not analyze.is_valid_test_path(inputs["path"]):
+            return (
+                f"Refused: '{inputs['path']}' is not a conventional test file path "
+                "(expected backend/tests/**/test_*.py or frontend/src/**/*.test.ts(x)|*.spec.ts(x)). "
+                "Only test files may be written."
+            )
         path = _resolve_safe_path(inputs["path"])
         if path is None:
             return "Access denied: path outside repository root."
@@ -245,6 +268,15 @@ def execute_tool(name: str, inputs: dict, context: AgentContext) -> str:
         return f"[{status}]\n{result.output}"
 
     if name == "commit_tests":
+        invalid = [
+            p for p in inputs["paths"]
+            if p not in context.written_files or not analyze.is_valid_test_path(p)
+        ]
+        if invalid:
+            return (
+                "Refused: the following paths were either not written by write_file "
+                f"in this session, or are not valid test file paths: {invalid}"
+            )
         git_ops.configure_git(str(REPO_ROOT))
         sha = git_ops.commit_and_push(
             paths=inputs["paths"],
@@ -258,10 +290,13 @@ def execute_tool(name: str, inputs: dict, context: AgentContext) -> str:
         return "Nothing to commit — files already staged or unchanged."
 
     if name == "post_pr_comment":
+        body = inputs["body"]
+        if len(body) > _PR_COMMENT_LIMIT:
+            body = body[:_PR_COMMENT_LIMIT] + "\n\n... (comment truncated)"
         github_api.post_pr_comment(
             repo=context.repo,
             pr_number=context.pr_number,
-            body=inputs["body"],
+            body=body,
         )
         context.comment_posted = True
         return "Comment posted."
@@ -340,10 +375,9 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
         kind = analyze.classify(f["filename"])
         test_path = analyze.expected_test_path(f["filename"])
         patch = f.get("patch", "(binary or no diff available)")
-        _PATCH_LIMIT = 3000
         patch_body = patch[:_PATCH_LIMIT]
         if len(patch) > _PATCH_LIMIT:
-            patch_body += "\n... (diff truncated — only the first 3000 characters are shown)"
+            patch_body += f"\n... (diff truncated — only the first {_PATCH_LIMIT} characters are shown)"
         file_summaries.append(
             f"### {f['filename']} ({kind}, status: {f['status']})\n"
             f"Expected test file: `{test_path}`\n\n"
@@ -401,10 +435,13 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
                 continue
             print(f"[tool] {block.name}({json.dumps(block.input)[:120]})", flush=True)
             result_text = execute_tool(block.name, block.input, context)
+            content_text = result_text[:_TOOL_RESULT_LIMIT]
+            if len(result_text) > _TOOL_RESULT_LIMIT:
+                content_text += "\n... (tool output truncated)"
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
-                "content": result_text[:8000],  # cap to avoid oversized context
+                "content": content_text,
             })
 
         messages.append({"role": "user", "content": tool_results})
@@ -415,12 +452,25 @@ def run(repo: str, pr_number: int, pr_branch: str) -> None:
 
     else:
         print(f"Reached turn limit ({MAX_AGENT_TURNS}) without completion.", file=sys.stderr)
+        if not context.comment_posted:
+            github_api.post_pr_comment(
+                repo=repo,
+                pr_number=pr_number,
+                body=(
+                    "## Test Agent\n\n"
+                    f"Reached the turn limit ({MAX_AGENT_TURNS}) before finishing. "
+                    "Check the workflow run logs for details."
+                ),
+            )
 
 
 def main() -> None:
-    repo = os.environ["REPO_FULL_NAME"]
-    pr_number = int(os.environ["PR_NUMBER"])
-    pr_branch = os.environ["PR_HEAD_REF"]
+    try:
+        repo = os.environ["REPO_FULL_NAME"]
+        pr_number = int(os.environ["PR_NUMBER"])
+        pr_branch = os.environ["PR_HEAD_REF"]
+    except KeyError as exc:
+        sys.exit(f"Missing required environment variable: {exc}")
     run(repo, pr_number, pr_branch)
 
 

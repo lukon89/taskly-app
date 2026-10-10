@@ -8,6 +8,7 @@ from skills.analyze import (
     expected_test_path,
     filter_changed_files,
     is_testable,
+    is_valid_test_path,
 )
 
 
@@ -185,6 +186,53 @@ def test_is_testable_returns_false_for_python_boilerplate(path: str) -> None:
 ])
 def test_is_testable_returns_false_for_unsupported_extensions(path: str) -> None:
     assert is_testable(path) is False
+
+
+# ---------------------------------------------------------------------------
+# is_testable — files outside backend/ and frontend/ are never testable, even
+# when they have a source-like extension and no other skip pattern applies.
+# expected_test_path() has no naming convention for these and would otherwise
+# fall back to returning the source path unchanged.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("path", [
+    "agent/skills/analyze.py",
+    "agent/main.py",
+    "scripts/seed.py",
+    "scripts/tool.ts",
+])
+def test_is_testable_returns_false_outside_backend_and_frontend(path: str) -> None:
+    assert is_testable(path) is False
+
+
+# ---------------------------------------------------------------------------
+# is_valid_test_path — guards what write_file/commit_tests are allowed to touch
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("path", [
+    "backend/tests/features/todos/test_router.py",
+    "backend/tests/api/test_dependencies.py",
+    "backend/tests/test_top_level.py",
+    "frontend/src/features/todos/hooks/useTodoFilters.test.ts",
+    "frontend/src/features/todos/components/TodoList.test.tsx",
+    "frontend/src/App.spec.tsx",
+    "frontend/src/hooks/useNotice.spec.ts",
+])
+def test_is_valid_test_path_accepts_conventional_test_paths(path: str) -> None:
+    assert is_valid_test_path(path) is True
+
+
+@pytest.mark.parametrize("path", [
+    "backend/app/features/todos/router.py",                 # source file, not a test
+    "backend/tests/features/todos/router.py",                # under tests/ but missing test_ prefix
+    "backend/tests/features/todos/test_router.txt",          # not a .py file
+    "frontend/src/features/todos/hooks/useTodoFilters.ts",   # source, not .test/.spec
+    "frontend/src/features/todos/hooks/useTodoFilters.ts.bak",
+    "agent/main.py",                                          # outside backend/frontend entirely
+    "backend/app/features/todos/test_helpers.py",             # test_-looking name but not under tests/
+])
+def test_is_valid_test_path_rejects_non_test_paths(path: str) -> None:
+    assert is_valid_test_path(path) is False
 
 
 # ---------------------------------------------------------------------------
