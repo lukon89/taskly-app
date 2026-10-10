@@ -16,7 +16,7 @@ _SKIP_PATTERNS = (
     re.compile(r"/node_modules/"),
     re.compile(r"\.(md|txt|json|yaml|yml|toml|ini|env|gitignore|prettierrc|dockerignore|css)$"),
     re.compile(r"^(Dockerfile|compose\.yaml|requirements.*\.txt|pytest\.ini|vite\.config\.|tsconfig\.)"),
-    re.compile(r"/stories\.[jt]sx?$"),
+    re.compile(r"\.stories\.[jt]sx?$"),
     re.compile(r"/index\.[jt]sx?$"),
     re.compile(r"/types?\.[jt]s$"),
     re.compile(r"/constants?\.[jt]s$"),
