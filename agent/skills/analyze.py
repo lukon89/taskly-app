@@ -100,3 +100,28 @@ def filter_changed_files(pr_files: list[dict]) -> list[dict]:
         f for f in pr_files
         if f.get("status") != "removed" and is_testable(f["filename"])
     ]
+
+
+def find_untested_files(repo_root: str, limit: int = 10) -> list[str]:
+    """Walk the repo and return source file paths that have no corresponding test file.
+
+    Only considers files under backend/app/ and frontend/src/ that pass the
+    is_testable() filter. Returns at most `limit` files so the agent doesn't
+    receive an overwhelming initial prompt.
+    """
+    root = Path(repo_root)
+    untested: list[str] = []
+    for path in sorted(root.glob("**/*")):
+        if not path.is_file():
+            continue
+        rel = str(path.relative_to(root))
+        if not is_testable(rel):
+            continue
+        test_path = expected_test_path(rel)
+        if test_path == rel:
+            continue  # no convention for this path — skip
+        if not (root / test_path).exists():
+            untested.append(rel)
+        if len(untested) >= limit:
+            break
+    return untested

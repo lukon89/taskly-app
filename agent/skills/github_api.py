@@ -70,3 +70,14 @@ def get_pr_files(repo: str, pr_number: int) -> list[dict[str, Any]]:
 def post_pr_comment(repo: str, pr_number: int, body: str) -> None:
     """Post a markdown comment on the pull request."""
     _request("POST", f"/repos/{repo}/issues/{pr_number}/comments", {"body": body})
+
+
+def open_pr(repo: str, title: str, body: str, head: str, base: str = "main") -> str:
+    """Open a pull request and return its HTML URL."""
+    data = _request("POST", f"/repos/{repo}/pulls", {
+        "title": title,
+        "body": body,
+        "head": head,
+        "base": base,
+    })
+    return data["html_url"]
