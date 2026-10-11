@@ -27,7 +27,7 @@ from skills import analyze, git_ops, github_api, test_runner
 
 REPO_ROOT = Path(__file__).parent.parent
 MAX_AGENT_TURNS = 80
-MODEL = os.environ.get("AGENT_MODEL", "claude-opus-4-5")
+MODEL = os.environ.get("AGENT_MODEL", "claude-haiku-4-5-20251001")
 _TOOL_RESULT_LIMIT = 8000
 _PR_BODY_LIMIT = 60000
 # Cap on untested files per scan run so the prompt stays manageable.

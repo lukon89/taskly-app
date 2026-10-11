@@ -26,7 +26,7 @@ from skills import analyze, evaluate, git_ops, github_api, test_runner
 
 REPO_ROOT = Path(__file__).parent.parent
 MAX_AGENT_TURNS = 60  # safety cap to avoid runaway loops
-MODEL = os.environ.get("AGENT_MODEL", "claude-opus-4-5")
+MODEL = os.environ.get("AGENT_MODEL", "claude-haiku-4-5-20251001")
 _PATCH_LIMIT = 3000  # characters of diff shown per file in the initial prompt
 _TOOL_RESULT_LIMIT = 8000  # characters of tool output kept per turn, to bound context growth
 _PR_COMMENT_LIMIT = 60000  # stay under GitHub's 65536-character comment body limit
