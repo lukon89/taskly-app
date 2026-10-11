@@ -1,0 +1,78 @@
+name: Coverage Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: 'Branch to scan and target for the PR'
+        required: false
+        default: 'main'
+      scan_limit:
+        description: 'Max source files to cover per run (default: 10)'
+        required: false
+        default: '10'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  scan:
+    name: Find & fill missing tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+
+      - name: Create scan branch
+        id: branch
+        run: |
+          BRANCH="test-agent/coverage-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH"
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install backend test dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install agent dependencies
+        working-directory: agent
+        run: pip install -r requirements.txt
+
+      - name: Check required secret
+        run: |
+          if [ -z "${{ secrets.ANTHROPIC_API_KEY }}" ]; then
+            echo "::error::ANTHROPIC_API_KEY secret is not configured."
+            exit 1
+          fi
+
+      - name: Run coverage scan agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL_NAME: ${{ github.repository }}
+          SCAN_BRANCH: ${{ steps.branch.outputs.name }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          SCAN_LIMIT: ${{ inputs.scan_limit }}
+        run: python agent/scan_main.py

@@ -52,6 +52,14 @@ jobs:
         working-directory: agent
         run: pip install -r requirements.txt
 
+      - name: Check required secret
+        run: |
+          if [ -z "${{ secrets.ANTHROPIC_API_KEY }}" ]; then
+            echo "::error::ANTHROPIC_API_KEY secret is not configured."
+            echo "::error::Add it under Settings → Secrets → Actions → New repository secret."
+            exit 1
+          fi
+
       - name: Run test agent
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

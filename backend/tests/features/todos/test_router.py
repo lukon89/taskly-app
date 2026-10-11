@@ -8,7 +8,21 @@ def test_list_returns_tasks_from_repository(client, repository_mock, todo):
     response = client.get("/api/todos")
     assert response.status_code == 200
     assert response.json() == [todo.model_dump(mode="json")]
-    repository_mock.list.assert_called_once_with()
+    repository_mock.list.assert_called_once_with(priority=None)
+
+
+def test_list_forwards_priority_filter_to_repository(client, repository_mock, todo):
+    repository_mock.list.return_value = [todo]
+    response = client.get("/api/todos?priority=high")
+    assert response.status_code == 200
+    from app.features.todos.schemas import Priority
+    repository_mock.list.assert_called_once_with(priority=Priority.high)
+
+
+@pytest.mark.parametrize("priority", ["urgent", "HIGH", "1"])
+def test_list_rejects_invalid_priority_values(client, repository_mock, priority):
+    assert client.get(f"/api/todos?priority={priority}").status_code == 422
+    repository_mock.list.assert_not_called()
 
 
 def test_create_trims_input_and_returns_created_task(client, repository_mock, todo):

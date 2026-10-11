@@ -5,15 +5,17 @@ from sqlalchemy.orm import Session
 
 from .mappers import from_model
 from .models import TodoRecord
-from .schemas import Todo, TodoCreate, TodoUpdate
+from .schemas import Priority, Todo, TodoCreate, TodoUpdate
 
 
 class TodoRepository:
     def __init__(self, session: Session):
         self.session = session
 
-    def list(self) -> list[Todo]:
+    def list(self, priority: Priority | None = None) -> list[Todo]:
         statement = select(TodoRecord).order_by(TodoRecord.created_at.desc(), TodoRecord.id.desc())
+        if priority is not None:
+            statement = statement.where(TodoRecord.priority == priority.value)
         return [from_model(record) for record in self.session.scalars(statement)]
 
     def get(self, todo_id: int) -> Todo | None:

@@ -31,6 +31,12 @@ def commit_and_push(
     """
     cwd = Path(repo_root)
 
+    missing = [p for p in paths if not (cwd / p).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Cannot commit: the following paths do not exist: {missing}"
+        )
+
     # Stage only the specified files
     for path in paths:
         subprocess.run(["git", "add", path], cwd=cwd, check=True)
