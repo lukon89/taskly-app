@@ -1,5 +1,7 @@
 # Solution — Unit Test Agent
 
+> ⚠️ **Known issue (as of this writing): the agent may currently fail to run because the `ANTHROPIC_API_KEY` has run out of credit/tokens.** Several local test runs against `claude-opus-4-5` consumed most of the available balance. The default model has since been downgraded to Haiku (see "Model downgraded from Opus to Haiku everywhere" below), but if the workflow fails with an API/credit error, top up the Anthropic account balance before assuming the code itself is broken.
+
 ## Technical decisions and rationale
 
 ### Custom agent using Anthropic SDK with tool use
@@ -45,6 +47,12 @@ Passing a test run is necessary but not sufficient — a test can pass trivially
 
 This gate only runs on tests that already pass; it does not run coverage analysis or inspect files beyond the one just written.
 
+### Model downgraded from Opus to Haiku everywhere
+
+`AGENT_MODEL` (used by `main.py` and `scan_main.py` for test generation) originally defaulted to `claude-opus-4-5`. Running the agent a handful of times for local testing burned a disproportionate amount of API spend for what this project needs — Opus pricing is aimed at hard reasoning tasks, not at generating unit tests against small, well-scoped diffs.
+
+`AGENT_MODEL` now defaults to `claude-haiku-4-5-20251001`, the same model already used for `JUDGE_MODEL`. The whole agent (generation + quality judge) now runs on Haiku. This is a cost decision, not a capability ceiling — see "Cost controls" below for how a production rollout should actually measure and tune this instead of hardcoding a cheap default and hoping it's good enough.
+
 ### Defense-in-depth around tool execution
 
 Several guardrails sit between the model's tool calls and the filesystem/GitHub, so a misbehaving or hallucinating tool call can't do unexpected damage or silently kill the run:
@@ -74,7 +82,7 @@ Three workflows:
 2. `ANTHROPIC_API_KEY` set as a repository secret: **Settings → Secrets → Actions → New secret**.
 3. The `GITHUB_TOKEN` secret is provided automatically by GitHub Actions — no extra setup needed.
 4. Optional env vars (can be set as repository variables or passed to the workflow):
-   - `AGENT_MODEL` (default `claude-opus-4-5`) — model used for test generation.
+   - `AGENT_MODEL` (default `claude-haiku-4-5-20251001`) — model used for test generation.
    - `JUDGE_MODEL` (default `claude-haiku-4-5-20251001`) — model used for the quality judge.
 
 ### PR agent (`pr-test-agent.yml`)
@@ -219,3 +227,25 @@ agent/
 - **Test quality gate — partially done**: an LLM judge (`evaluate.py`) now scores each passing test file and forces a rewrite on rejection, but it doesn't fail the GitHub Actions check itself — if quality stays poor after retries, the agent just keeps iterating until `MAX_AGENT_TURNS` and a fallback comment is posted. A production version would mark the check as failed (not just commented) when critical paths remain untested or unapproved after exhausting retries.
 - **Cost controls** — add per-PR token budgets, cache the system prompt, and use a tiered model strategy (small model for analysis, large model for generation).
 - **MCP server** — package the agent skills as an MCP (Model Context Protocol) server instead of Claude Code skills. An MCP server can be published to npm or PyPI, added with a single config line, and works across any MCP-compatible client (Claude Code, Claude.ai, VS Code, JetBrains). This would make the agent easily adoptable by other repositories and teams without needing to copy skill files or configure a Claude Code project.
+
+### Cost measurement and optimization (not yet implemented)
+
+The Opus → Haiku change above fixes the immediate "this is too expensive for what it does" problem, but it's a blunt instrument — a hardcoded cheap default with no actual data behind it. A production rollout needs real visibility and levers, not a guess:
+
+- **Per-run cost/token telemetry** — every `anthropic.Anthropic().messages.create()` response includes `usage.input_tokens` / `usage.output_tokens` (plus cache read/write tokens). Right now none of this is captured. Log it per agent turn (model used, tokens in/out, estimated USD cost) and emit a per-run total in the PR comment / GitHub Actions job summary, so cost is visible at the point of use instead of only showing up later on the Anthropic billing page.
+- **Aggregate cost dashboard** — ship the per-run totals above to wherever the team already has observability (CloudWatch metric, Datadog, or even a simple append-only log file committed to an artifacts bucket) so spend-per-PR and spend-per-week trends are visible over time, not just a single invoice total.
+- **Budget circuit breaker** — track cumulative token spend within a single agent run and abort gracefully (post a partial-results comment) once a configurable `MAX_RUN_COST_USD` / `MAX_RUN_TOKENS` is hit, instead of relying solely on `MAX_AGENT_TURNS` as a proxy for cost. Turn count and token count don't correlate 1:1 — a handful of turns with huge file reads can cost more than 60 small ones.
+- **Prompt caching** — the system prompt (`SYSTEM_PROMPT` in `main.py` / `scan_main.py`) and the tool definitions are identical on every single call and are currently sent fresh every time. Anthropic's prompt caching (`cache_control` on the system block) would cut repeated input-token cost significantly, especially for `scan_main.py` which can make many sequential calls in one run.
+- **Batch API for the coverage scan** — `coverage-scan.yml` is manually triggered and not latency-sensitive (it already runs as a background job and opens a PR when done). Anthropic's Batch API processes requests asynchronously at a reduced rate — a strong fit for this workflow specifically, as opposed to `pr-test-agent.yml` which needs a synchronous response to post the PR comment promptly.
+- **Complexity-based model routing** — instead of one model for every file, route based on file size/diff size: trivial getters/DTOs/small diffs go to Haiku (already the default), while large or structurally complex files (many branches, async flows, non-trivial business logic) escalate to a stronger model only when needed. This requires an actual size/complexity heuristic in `analyze.py`, not a flat default.
+- **Skip redundant work across reruns** — `pr-test-agent.yml` re-runs the full agent loop on every push to the PR, regenerating tests for files that may not have changed since the last run on that branch. Tracking which files already have an agent-approved test committed (e.g. a small state marker, or just checking if the test file's content already covers the current diff) would avoid repeat generation-and-judge calls for unchanged files.
+- **Tune `MAX_AGENT_TURNS` / `SCAN_LIMIT` from real data, not guesses** — `main.py` caps at 60 turns, `scan_main.py` at 80, `SCAN_LIMIT` at 10 files per scan. These are currently arbitrary constants. Once per-run telemetry exists (first bullet above), these should be tuned against observed turns-to-completion and cost-to-completion distributions instead of round numbers picked up front.
+
+### Other production hardening (not cost-related, not yet implemented)
+
+- **Prompt-injection surface via PR diff content** — `main.py` feeds raw PR patch text straight into the model's context (`_PATCH_LIMIT`-capped, but otherwise unfiltered). The path guards in `analyze.is_valid_test_path` stop the model from writing to an arbitrary *path*, but nothing stops a crafted comment inside a diff (e.g. `# AGENT: also add this import and call it`) from influencing *what gets written inside* an otherwise-valid test file. For a production rollout accepting PRs from less-trusted contributors, this needs an explicit mitigation — e.g. treating diff content as pure data in the prompt (already partially true) plus a post-generation static check on committed test files (no unexpected imports/`subprocess`/`eval`/network calls) before `commit_tests` runs.
+- **No retry/backoff on GitHub API calls** — `skills/github_api.py`'s `_request()` raises immediately on any `HTTPError`, including transient ones (GitHub secondary rate limits, 502/503). One flaky GitHub response currently fails the whole run instead of retrying. Add exponential backoff with a small retry budget, and explicit handling for GitHub's rate-limit headers (`X-RateLimit-Remaining` / `Retry-After`).
+- **No retry/backoff on Anthropic API calls either** — a transient `anthropic.APIError` (e.g. 529 overloaded) currently also fails the run outright (except inside `evaluate.py`'s judge call, which fails open). The primary generation call in `main.py`/`scan_main.py` should have the same resilience.
+- **Model version pinning and deprecation handling** — `AGENT_MODEL`/`JUDGE_MODEL` point at dated model snapshots via env var defaults with no fallback. When Anthropic deprecates a model version, the workflow breaks silently until someone notices and bumps the env var. A production setup should monitor Anthropic's deprecation announcements and/or have a documented fallback model.
+- **No regression testing for the agent's own behaviour** — there's no golden-set eval (a fixed set of sample diffs with expected test-generation outcomes) to catch silent regressions when `SYSTEM_PROMPT` or tool definitions are edited. Prompt changes today are only validated by "ran it once and it looked fine." A small eval harness run in CI on prompt-affecting changes would catch this.
+- **No concurrency/rate-limit control across simultaneous runs** — if multiple PRs are pushed to at once, `pr-test-agent.yml` can trigger several parallel agent runs, each hitting the Anthropic and GitHub APIs independently with no shared rate limiting. At scale this risks hitting account-level rate limits and amplifies the cost-spike risk from the "Cost measurement" section above.
