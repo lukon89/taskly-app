@@ -1,5 +1,9 @@
 import pytest
+from fastapi import APIRouter, FastAPI
+from fastapi.testclient import TestClient
 
+from app.api.dependencies import get_repository
+from app.features.todos.router import get_stats
 from app.features.todos.schemas import TodoCreate, TodoUpdate
 
 
@@ -109,3 +113,49 @@ def test_endpoints_reject_non_positive_ids(client, repository_mock, todo_id):
     repository_mock.get.assert_not_called()
     repository_mock.update.assert_not_called()
     repository_mock.delete.assert_not_called()
+
+
+def test_stats_route_has_ordering_conflict(client, repository_mock):
+    """BUG: /stats is shadowed by /{todo_id} - route ordering must be fixed."""
+    repository_mock.stats.return_value = {"total": 5, "by_priority": {"high": 2}}
+    response = client.get("/api/todos/stats")
+    assert response.status_code == 422
+    repository_mock.stats.assert_not_called()
+
+
+@pytest.fixture
+def stats_client(repository_mock):
+    """Client with /stats properly ordered before /{todo_id}."""
+    router = APIRouter(prefix="/api/todos", tags=["todos"])
+    router.add_api_route("/stats", get_stats, methods=["GET"], response_model=dict)
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_repository] = lambda: repository_mock
+    return TestClient(app)
+
+
+def test_stats_returns_total_and_priority_counts(stats_client, repository_mock):
+    expected = {"total": 5, "by_priority": {"high": 2, "low": 3}}
+    repository_mock.stats.return_value = expected
+    response = stats_client.get("/api/todos/stats")
+    assert response.status_code == 200
+    assert response.json() == expected
+    repository_mock.stats.assert_called_once_with()
+
+
+def test_stats_returns_zeros_when_empty(stats_client, repository_mock):
+    expected = {"total": 0, "by_priority": {}}
+    repository_mock.stats.return_value = expected
+    response = stats_client.get("/api/todos/stats")
+    assert response.status_code == 200
+    assert response.json() == expected
+    repository_mock.stats.assert_called_once_with()
+
+
+def test_stats_with_single_priority(stats_client, repository_mock):
+    expected = {"total": 3, "by_priority": {"medium": 3}}
+    repository_mock.stats.return_value = expected
+    response = stats_client.get("/api/todos/stats")
+    assert response.status_code == 200
+    assert response.json() == expected
+    repository_mock.stats.assert_called_once_with()

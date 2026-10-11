@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .mappers import from_model
@@ -48,3 +48,12 @@ class TodoRepository:
         self.session.delete(record)
         self.session.commit()
         return True
+
+    def stats(self) -> dict:
+        total = self.session.scalar(select(func.count()).select_from(TodoRecord)) or 0
+        rows = self.session.execute(
+            select(TodoRecord.priority, func.count().label("count"))
+            .group_by(TodoRecord.priority)
+        ).all()
+        by_priority = {row.priority: row.count for row in rows}
+        return {"total": total, "by_priority": by_priority}

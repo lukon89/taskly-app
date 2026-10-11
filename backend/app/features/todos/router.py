@@ -43,3 +43,8 @@ def delete_todo(todo_id: TodoId, repo: Repository):
     if not repo.delete(todo_id):
         raise HTTPException(404, "Task not found.")
     return Response(status_code=204)
+
+
+@router.get("/stats", response_model=dict)
+def get_stats(repo: Repository):
+    return repo.stats()

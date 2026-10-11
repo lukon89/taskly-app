@@ -125,3 +125,32 @@ def test_delete_removes_record_and_returns_true(model_factory, todo_values):
     assert TodoRepository(session).delete(todo_values["id"]) is True
     session.delete.assert_called_once_with(record)
     session.commit.assert_called_once()
+
+
+def test_stats_returns_total_and_by_priority_counts():
+    session = Mock(spec=Session)
+    session.scalar.return_value = 5
+    # Simulate rows returned by the group by query
+    row_high = Mock()
+    row_high.priority = "high"
+    row_high.count = 2
+    row_low = Mock()
+    row_low.priority = "low"
+    row_low.count = 3
+    session.execute.return_value.all.return_value = [row_high, row_low]
+
+    result = TodoRepository(session).stats()
+
+    assert result == {"total": 5, "by_priority": {"high": 2, "low": 3}}
+    session.scalar.assert_called_once()
+    session.execute.assert_called_once()
+
+
+def test_stats_returns_zero_total_when_no_records():
+    session = Mock(spec=Session)
+    session.scalar.return_value = None  # No records
+    session.execute.return_value.all.return_value = []
+
+    result = TodoRepository(session).stats()
+
+    assert result == {"total": 0, "by_priority": {}}
